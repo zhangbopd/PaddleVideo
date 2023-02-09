@@ -27,6 +27,14 @@ from ..metrics.ava_utils import collect_results_cpu
 from ..modeling.builder import build_model
 from ..solver import build_lr, build_optimizer
 from ..utils import do_preciseBN
+# FIXME: For Time-only profile
+# import paddle.profiler as pro
+
+# FIXME: For nsys Timeline profile
+# import paddle.fluid.core as core
+# import sys
+# nsys profile --stats true -w true -t cuda,nvtx,osrt,cudnn,cublas -s cpu --capture-range=cudaProfilerApi -x true --force-overwrite true -o ${output_filename}
+# python train.py ...
 
 
 def train_model(cfg,
@@ -109,11 +117,10 @@ def train_model(cfg,
 
     # 2. Construct dataset and dataloader for training and evaluation
     train_dataset = build_dataset((cfg.DATASET.train, cfg.PIPELINE.train))
-    train_dataloader_setting = dict(
-        batch_size=batch_size,
-        num_workers=num_workers,
-        collate_fn_cfg=cfg.get('MIX', None),
-        places=places)
+    train_dataloader_setting = dict(batch_size=batch_size,
+                                    num_workers=num_workers,
+                                    collate_fn_cfg=cfg.get('MIX', None),
+                                    places=places)
     train_loader = build_dataloader(train_dataset, **train_dataloader_setting)
 
     if validate:
@@ -132,22 +139,23 @@ def train_model(cfg,
 
     # 3. Construct learning rate scheduler(lr) and optimizer
     lr = build_lr(cfg.OPTIMIZER.learning_rate, len(train_loader))
-    optimizer = build_optimizer(
-        cfg.OPTIMIZER, lr, model=model, use_amp=use_amp, amp_level=amp_level)
+    optimizer = build_optimizer(cfg.OPTIMIZER,
+                                lr,
+                                model=model,
+                                use_amp=use_amp,
+                                amp_level=amp_level)
 
     # 4. Construct scalar and convert parameters for amp(optional)
     if use_amp:
-        scaler = amp.GradScaler(
-            init_loss_scaling=2.0**16,
-            incr_every_n_steps=2000,
-            decr_every_n_nan_or_inf=1)
+        scaler = amp.GradScaler(init_loss_scaling=2.0**16,
+                                incr_every_n_steps=2000,
+                                decr_every_n_nan_or_inf=1)
         # convert model parameters to fp16 when amp_level is O2(pure fp16)
-        model, optimizer = amp.decorate(
-            models=model,
-            optimizers=optimizer,
-            level=amp_level,
-            master_weight=True,
-            save_dtype=None)
+        model, optimizer = amp.decorate(models=model,
+                                        optimizers=optimizer,
+                                        level=amp_level,
+                                        master_weight=True,
+                                        save_dtype=None)
         # NOTE: save_dtype is set to float32 now.
         logger.info(f"Training in amp mode, amp_level={amp_level}.")
     else:
@@ -182,6 +190,10 @@ def train_model(cfg,
 
     # 8. Train Model
     best = 0.0
+    # FIXME: For Time-only profile
+    # p = pro.Profiler(timer_only=True)
+    # p.start()
+    # print("Start time_only profiling...")
     for epoch in range(0, cfg.epochs):
         if epoch < resume_epoch:
             logger.info(
@@ -195,20 +207,39 @@ def train_model(cfg,
         for i, data in enumerate(train_loader):
             """Next two line of code only used in test_tipc,
             ignore it most of the time"""
+
+            # FIXME: For nsys Timeline profile
+            # if i == 10:
+            #     core.nvprof_start()
+            #     core.nvprof_enable_record_event()
+            #     core.nvprof_nvtx_push(str(i))
+            # if i == 20:
+            #     core.nvprof_nvtx_pop()
+            #     core.nvprof_stop()
+            #     sys.exit()
+            # if i > 100 and i < 110:
+            #     core.nvprof_nvtx_pop()
+            #     core.nvprof_nvtx_push(str(i))
+
+            # FIXME: For OP-details profile
+            # if i == 0:
+            #     paddle.fluid.profiler.start_profiler("GPU", "Default")
+            # if i == 100:
+            #     paddle.fluid.profiler.stop_profiler("total", "video.profile")
             if max_iters is not None and i >= max_iters:
                 break
 
             record_list['reader_time'].update(time.time() - tic)
 
             # Collect performance information when profiler_options is activate
+            # FIXME: Model default profiler
             add_profiler_step(profiler_options)
 
             # 8.1 forward
             # AMP #
             if use_amp:
-                with amp.auto_cast(
-                        custom_black_list={"reduce_mean", "conv3d"},
-                        level=amp_level):
+                with amp.auto_cast(custom_black_list={"reduce_mean", "conv3d"},
+                                   level=amp_level):
                     outputs = model(data, mode='train')
                 avg_loss = outputs['loss']
                 if use_gradient_accumulation:
@@ -277,7 +308,8 @@ def train_model(cfg,
             # learning rate iter step
             if cfg.OPTIMIZER.learning_rate.get("iter_step"):
                 lr.step()
-
+            # FIXME: For Time-only profile
+            # p.step()
         # learning rate epoch step
         if not cfg.OPTIMIZER.learning_rate.get("iter_step"):
             lr.step()
@@ -349,7 +381,8 @@ def train_model(cfg,
                 return best, best_flag
 
             if cfg.MODEL.framework == "YOWOLocalizer" and (not parallel or
-                                                           (parallel and rank == 0)):
+                                                           (parallel
+                                                            and rank == 0)):
                 if record_list["fscore"].avg > best:
                     best = record_list["fscore"].avg
                     best_flag = True
@@ -369,12 +402,12 @@ def train_model(cfg,
             return best, best_flag
 
         # use precise bn to improve acc
-        if cfg.get("PRECISEBN") and (
-                epoch % cfg.PRECISEBN.preciseBN_interval == 0
-                or epoch == cfg.epochs - 1):
-            do_preciseBN(model, train_loader, parallel,
-                         min(cfg.PRECISEBN.num_iters_preciseBN,
-                             len(train_loader)), use_amp, amp_level)
+        if cfg.get("PRECISEBN") and (epoch % cfg.PRECISEBN.preciseBN_interval
+                                     == 0 or epoch == cfg.epochs - 1):
+            do_preciseBN(
+                model, train_loader, parallel,
+                min(cfg.PRECISEBN.num_iters_preciseBN, len(train_loader)),
+                use_amp, amp_level)
 
         # 9. Validation
         if validate and (epoch % cfg.get("val_interval", 1) == 0
@@ -386,10 +419,9 @@ def train_model(cfg,
                 save(optimizer.state_dict(),
                      osp.join(output_dir, model_name + "_best.pdopt"))
                 save_student_model_flag = True if "Distillation" in cfg.MODEL.framework else False
-                save(
-                    model.state_dict(),
-                    osp.join(output_dir, model_name + "_best.pdparams"),
-                    save_student_model=save_student_model_flag)
+                save(model.state_dict(),
+                     osp.join(output_dir, model_name + "_best.pdparams"),
+                     save_student_model=save_student_model_flag)
                 if model_name == "AttentionLstm":
                     logger.info(
                         f"Already save the best model (hit_at_one){best}")
@@ -416,11 +448,15 @@ def train_model(cfg,
 
         # 10. Save model and optimizer
         if epoch % cfg.get("save_interval", 1) == 0 or epoch == cfg.epochs - 1:
-            save(optimizer.state_dict(),
-                 osp.join(output_dir,
-                          model_name + f"_epoch_{epoch + 1:05d}.pdopt"))
-            save(model.state_dict(),
-                 osp.join(output_dir,
-                          model_name + f"_epoch_{epoch + 1:05d}.pdparams"))
-
+            save(
+                optimizer.state_dict(),
+                osp.join(output_dir,
+                         model_name + f"_epoch_{epoch + 1:05d}.pdopt"))
+            save(
+                model.state_dict(),
+                osp.join(output_dir,
+                         model_name + f"_epoch_{epoch + 1:05d}.pdparams"))
+    # FIXME: For Time-only profile
+    # p.stop()
+    # print("Stop time_only profiling...")
     logger.info(f'training {model_name} finished')
